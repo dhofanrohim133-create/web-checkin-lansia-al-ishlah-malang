@@ -225,7 +225,7 @@
     let loginFails = 0, lockUntil = 0;
 
     const savedView = isAuthed() ? (sessionStorage.getItem('rt_last_view') || 'landing') : 'login';
-    const S = { view: savedView, step: 1, rid: null, mood: null, needs: [], customDate: null, noCheckins: false, checkinsErr: '', warned: false };
+    const S = { view: savedView, step: 1, rid: null, mood: null, needs: [], customDate: null };
 
     const MOODS = {
       1: { icon: 'frown', label: 'Sedih', color: '#ef4444' },
@@ -260,11 +260,6 @@
     const dateNote = () => S.customDate ? `<div class="mb-6 inline-flex items-center gap-2 bg-amber-50 dark:bg-amber-900/20 border border-amber-400 text-amber-700 dark:text-amber-400 font-bold rounded-xl px-4 py-2">${icon('calendar-days', 'w-5 h-5')} Mengisi untuk tanggal ${fmtLong(S.customDate)}</div>` : '';
 
     function dateBar() {
-      if (S.noCheckins) return `
-      <div class="rounded-2xl border border-red-300 dark:border-red-900/60 bg-red-50 dark:bg-red-900/20 p-4 text-red-700 dark:text-red-300">
-        <p class="font-bold flex items-center gap-2">${icon('triangle-alert', 'w-5 h-5')} Fitur tanggal belum aktif</p>
-        <p class="text-sm mt-1">Tabel <b>checkins</b> tidak bisa dibaca. Pesan dari Supabase: <b>${S.checkinsErr}</b></p>
-      </div>`;
       const custom = !!S.customDate;
       return `
       <div class="rounded-2xl border ${custom ? 'border-amber-400 bg-amber-50 dark:bg-amber-900/20' : 'border-slate-200 dark:border-slate-800 bg-white dark:bg-[#0f172a]'} p-4 shadow-sm">
@@ -284,7 +279,6 @@
 
     window.changeDate = function (v) {
       if (!v) return;
-      if (S.noCheckins) return;
       if (v > todayStr()) { toast('Tanggal tidak boleh melebihi hari ini.', true); render(); return; }
       S.customDate = (v === todayStr()) ? null : v;
       loadData(true);
@@ -392,43 +386,42 @@
     // ==========================================
     // 3. FUNGSI DATABASE
     // ==========================================
+    // Data check-in disimpan di kolom `history` (tabel residents) sebagai teks berformat:
+    //   "TANGGAL|mood|jam|kebutuhan1;kebutuhan2"   contoh: "2026-11-19|happy|08:30|Beribadah"
+    // Jadi tidak perlu membuat tabel baru di Supabase.
+    function parseRecords(h) {
+      const out = {};
+      if (!Array.isArray(h)) return out;
+      h.forEach(x => {
+        if (typeof x !== 'string' || !/^\d{4}-\d{2}-\d{2}\|/.test(x)) return;
+        const [d, mood, time, needs] = x.split('|');
+        out[d] = { mood, time: time || null, needs: needs ? needs.split(';') : [] };
+      });
+      return out;
+    }
+
     let loadSeq = 0;
     async function loadData(force = false) {
       const seq = ++loadSeq;
       const sel = curDate();
       const days = lastDates(sel, 7);
       try {
-        const [rRes, cRes] = await Promise.all([
-          supabaseClient.from('residents').select('*').order('id', { ascending: true }),
-          supabaseClient.from('checkins').select('*').gte('date', days[0]).lte('date', sel)
-        ]);
-        if (rRes.error) { toast("Database Terkunci! Matikan fitur RLS.", true); throw rRes.error; }
-        if (seq !== loadSeq) return; // ada permintaan yang lebih baru
+        const { data, error } = await supabaseClient.from('residents').select('*').order('id', { ascending: true });
+        if (error) { toast("Database Terkunci! Matikan fitur RLS.", true); throw error; }
+        if (seq !== loadSeq || !data) return; // ada permintaan yang lebih baru
 
-        let merged;
-        if (cRes.error) {
-          // Mode darurat: tabel checkins belum bisa dipakai -> tampilkan data lama, fitur tanggal dimatikan
-          S.noCheckins = true;
-          S.checkinsErr = cRes.error.message || cRes.error.code || 'tidak diketahui';
-          S.customDate = null;
-          if (!S.warned) { S.warned = true; toast("Fitur tanggal belum aktif: " + S.checkinsErr, true, 10000); }
-          merged = rRes.data;
-        } else {
-          S.noCheckins = false;
-          const byKey = {};
-          cRes.data.forEach(c => { byKey[c.resident_id + '|' + c.date] = c; });
-          merged = rRes.data.map(r => {
-            const c = byKey[r.id + '|' + sel];
-            return {
-              ...r,
-              filled: !!c,
-              mood: c ? c.mood : null,
-              needs: c ? (c.needs || []) : [],
-              time: c ? c.time : null,
-              history: days.map(d => { const x = byKey[r.id + '|' + d]; return x ? x.mood : null; })
-            };
-          });
-        }
+        const merged = data.map(r => {
+          const recs = parseRecords(r.history);
+          const c = recs[sel];
+          return {
+            ...r,
+            filled: !!c,
+            mood: c ? c.mood : null,
+            needs: c ? c.needs : [],
+            time: c ? c.time : null,
+            history: days.map(d => recs[d] ? recs[d].mood : null)
+          };
+        });
 
         const isChanged = JSON.stringify(DB.residents) !== JSON.stringify(merged);
         DB.residents = merged;
@@ -440,23 +433,20 @@
       const now = new Date();
       const timeStr = String(now.getHours()).padStart(2, '0') + ':' + String(now.getMinutes()).padStart(2, '0');
       const moodName = S.mood === 1 ? 'sad' : S.mood === 2 ? 'neutral' : 'happy';
+      const date = curDate();
+      const entry = [date, moodName, timeStr, S.needs.join(';')].join('|');
 
-      if (S.noCheckins) {
-        // Mode darurat (cara lama, hanya untuk hari ini)
-        const r = DB.residents.find(x => x.id == S.rid);
-        let h = Array.isArray(r.history) && r.history.length === 7 ? [...r.history] : [null, null, null, null, null, null, null];
-        if (!r.filled) { h.shift(); h.push(moodName); } else { h[6] = moodName; }
-        const { error: e2 } = await supabaseClient.from('residents').update({ filled: true, time: timeStr, mood: moodName, needs: S.needs, history: h }).eq('id', S.rid);
-        if (e2) return toast("Gagal menyimpan laporan.", true);
-        S.step = 3; render(); window.scrollTo(0, 0); $('#app').scrollTo(0, 0); loadData();
-        return;
-      }
+      // Ambil data terbaru dulu supaya tidak menimpa data lain
+      const { data: row, error: e1 } = await supabaseClient.from('residents').select('history').eq('id', S.rid).single();
+      if (e1) { console.error(e1); return toast("Gagal menyimpan laporan.", true); }
 
-      const { error } = await supabaseClient.from('checkins').upsert(
-        { resident_id: +S.rid, date: curDate(), mood: moodName, needs: S.needs, time: timeStr },
-        { onConflict: 'resident_id,date' }
-      );
-      if (error) { console.error(error); return toast("Gagal menyimpan laporan. Pastikan tabel 'checkins' sudah dibuat.", true); }
+      const cutoff = fmtDate(new Date(Date.now() - 120 * 86400000)); // simpan 120 hari terakhir
+      const raw = Array.isArray(row.history) ? row.history : [];
+      const keep = raw.filter(x => typeof x === 'string' && /^\d{4}-\d{2}-\d{2}\|/.test(x) && x.slice(0, 10) !== date && x.slice(0, 10) >= cutoff);
+      keep.push(entry);
+
+      const { error } = await supabaseClient.from('residents').update({ history: keep }).eq('id', S.rid);
+      if (error) { console.error(error); return toast("Gagal menyimpan laporan.", true); }
 
       S.step = 3;
       render();
